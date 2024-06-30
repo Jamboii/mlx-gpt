@@ -1,0 +1,5 @@
+# mlx-gpt
+
+This is a recreation of the GPT-2 architecture using the MLX library, closely following along with the organization and commit history of Andrej Karpathy's [build-nanogpt](https://github.com/karpathy/build-nanogpt) repository. While his repository focuses a lot on optimization using CUDA on PyTorch, MLX will need to build out optimizations using Metal and take advantage of Apple silicon's unified memory architecture. All code execution was tested on an Apple M1 Max Macbook Pro.
+
+This project came about due to an interest in optimizing neural network model training for Apple M-Series chips and the MLX library. Obviously I don't expect to see quite as much of performance gains as you could squeeze out of using CUDA on PyTorch with 8 A100 GPUs, but I'm interested to see what is even possible on these tiny chips.
