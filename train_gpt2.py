@@ -3,13 +3,22 @@ from dataclasses import dataclass
 
 # from functools import partial
 
+import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
 
 # import mlx.core.fast as F
 from mlx.utils import tree_flatten
 
-# import tiktoken
+import tiktoken
+
+
+def create_additive_causal_mask(N: int, offset: int = 0):
+    return mx.tril(mx.ones(shape=(N, N))).reshape(1, 1, N, N)
+    # rinds = mx.arange(offset + N)
+    # linds = mx.arange(offset, offset + N) if offset else rinds
+    # mask = linds[:, None] < rinds[None]
+    # return mask * -1e9
 
 
 class CausalSelfAttention(nn.Module):
@@ -23,23 +32,28 @@ class CausalSelfAttention(nn.Module):
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        # scale
+        self.scale = (self.n_embd // self.n_head) ** -0.5
+        # bias buffer (attention mask)
+        T = config.block_size
+        self.bias = mx.stop_gradient(mx.tril(mx.ones(shape=(T, T))).reshape(1, 1, T, T))
 
-    def forward(self, x):
+    def __call__(self, x):
         B, T, C = x.shape
 
         q, k, v = self.c_attn(x).split(3, axis=-1)
-        q = q.reshape(B, T, self.n_head, -1).transpose(0, 2, 1, 3)
-        k = k.reshape(B, T, self.n_head, -1).transpose(0, 2, 1, 3)
-        v = v.reshape(B, T, self.n_head, -1).transpose(0, 2, 1, 3)
+        q = q.reshape(B, T, self.n_head, C // self.n_head).transpose(0, 2, 1, 3)
+        k = k.reshape(B, T, self.n_head, C // self.n_head).transpose(0, 2, 1, 3)
+        v = v.reshape(B, T, self.n_head, C // self.n_head).transpose(0, 2, 1, 3)
 
         # scaled dot product attention calculation
-        scores = (q @ k.transpose(0, 1, 3, 2)) * self.n_embd**-0.5  # (B, nh, T, T)
+        scores = (q @ k.transpose(0, 1, 3, 2)) * self.scale  # (B, nh, T, T)
         causal_scores = mx.where(
-            mx.stop_gradient(mx.tril(scores)), mx.array(float("-inf")), scores
+            self.bias[:, :, :T, :T] == 0, mx.array(float("-inf")), scores
         )
         att = mx.softmax(causal_scores, axis=-1)
         y = att @ v
-        y = y.transpose(0, 2, 1, 3).reshape(B, T, -1)
+        y = y.transpose(0, 2, 1, 3).reshape(B, T, C)
         y = self.c_proj(y)
         return y
 
@@ -51,7 +65,7 @@ class MLP(nn.Module):
         self.gelu = nn.GELU(approx="precise")
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
 
-    def forward(self, x):
+    def __call__(self, x):
         x = self.c_fc(x)
         x = self.gelu(x)
         x = self.c_proj(x)
@@ -66,7 +80,7 @@ class Block(nn.Module):
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
-    def forward(self, x):
+    def __call__(self, x):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
@@ -94,6 +108,30 @@ class GPT(nn.Module):
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
+    def __call__(self, ix):
+        """
+        ix: (B, T)
+        """
+        B, T = ix.shape
+        assert (
+            T <= self.config.block_size
+        ), f"Cannot forward sequence of length {T}, block size is only {self.config.block_size}"
+
+        # forward the token and position embeddings
+        pos = mx.arange(0, T, dtype=mx.int64)
+        pos_emb = self.transformer["wpe"](pos)
+        tok_emb = self.transformer["wte"](ix)
+        x = tok_emb + pos_emb
+
+        # forward the blocks of the transformer
+        for block in self.transformer["h"]:
+            x = block(x)
+
+        # forward the final layer norm and classifier
+        x = self.transformer["ln_f"](x)
+        logits = self.lm_head(x)  # (B, T, V)
+        return logits
+
     @classmethod
     def from_pretrained(cls, model_type):
         """Loads pretrained GPT-2 model weights from huggingface"""
@@ -117,6 +155,7 @@ class GPT(nn.Module):
 
         sd = dict(tree_flatten(model))  # tree_flatten gets a list of key-val tuples
         sd_keys = sd.keys()
+        sd_keys_attn_bias = [k for k in sd_keys if k.endswith(".attn.bias")]
         sd_keys = [
             k for k in sd_keys if not k.endswith(".attn.bias")
         ]  # discard attention bias
@@ -151,10 +190,52 @@ class GPT(nn.Module):
                 assert sd_hf[k].shape == sd[k].shape
                 tensors[k] = mx.array(sd_hf[k].numpy())
 
+        # add back attention bias
+        for k in sd_keys_attn_bias:
+            tensors[k] = sd[k]
+
         model.load_weights(list(tensors.items()))
 
         return model
 
 
+num_return_sequences = 5  # B
+max_length = 30  # T
+
 model = GPT.from_pretrained("gpt2")
-print("didn't crash yippie")
+# model = GPT(GPTConfig())
+model.eval()
+
+enc = tiktoken.get_encoding("gpt2")
+tokens = enc.encode("Hello, I'm a language model,")
+tokens = mx.array(tokens, dtype=mx.int64)  # (8,)
+tokens = tokens[None, :]  # (1, 8)
+tokens = mx.repeat(tokens, repeats=num_return_sequences, axis=0)  # (B, 8)
+x = tokens  # (B, T)
+
+# generate!
+mx.random.seed(42)
+np.random.seed(42)
+while x.shape[1] < max_length:
+    # forward the model to get the logits
+    logits = model(x)  # (B, T, V)
+    # take the logits at the last position
+    logits = logits[:, -1]  # (B, V)
+    _, V = logits.shape
+
+    # top-k sampling of 50 (HF default)
+    topk_logits = mx.partition(logits, kth=V - 50, axis=-1)[:, -50:]
+    topk_indices = mx.argpartition(logits, kth=V - 50, axis=-1)[:, -50:]  # (B, 50)
+    ix = mx.random.categorical(topk_logits, num_samples=1)  # (B, 1)
+
+    # gather the corresponding indices
+    xcol = mx.take_along_axis(topk_indices, ix, axis=-1)  # (B, 1)
+    assert xcol.shape == (num_return_sequences, 1)
+    # append to the sequence
+    x = mx.concatenate((x, xcol), axis=1)
+
+# print the generated text
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist()
+    decoded = enc.decode(tokens)
+    print(">", decoded)
