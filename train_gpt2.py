@@ -6,19 +6,12 @@ from dataclasses import dataclass
 import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
+import mlx.optimizers as optim
 
 # import mlx.core.fast as F
 from mlx.utils import tree_flatten
 
 import tiktoken
-
-
-def create_additive_causal_mask(N: int, offset: int = 0):
-    return mx.tril(mx.ones(shape=(N, N))).reshape(1, 1, N, N)
-    # rinds = mx.arange(offset + N)
-    # linds = mx.arange(offset, offset + N) if offset else rinds
-    # mask = linds[:, None] < rinds[None]
-    # return mask * -1e9
 
 
 class CausalSelfAttention(nn.Module):
@@ -36,7 +29,9 @@ class CausalSelfAttention(nn.Module):
         self.scale = (self.n_embd // self.n_head) ** -0.5
         # bias buffer (attention mask)
         T = config.block_size
-        self.bias = mx.stop_gradient(mx.tril(mx.ones(shape=(T, T))).reshape(1, 1, T, T))
+        self.buf = mx.stop_gradient(mx.tril(mx.ones(shape=(T, T))).reshape(1, 1, T, T))
+        # freeze buffers
+        self.freeze(keys="buf")
 
     def __call__(self, x):
         B, T, C = x.shape
@@ -49,7 +44,7 @@ class CausalSelfAttention(nn.Module):
         # scaled dot product attention calculation
         scores = (q @ k.transpose(0, 1, 3, 2)) * self.scale  # (B, nh, T, T)
         causal_scores = mx.where(
-            self.bias[:, :, :T, :T] == 0, mx.array(float("-inf")), scores
+            self.buf[:, :, :T, :T] == 0, mx.array(float("-inf")), scores
         )
         att = mx.softmax(causal_scores, axis=-1)
         y = att @ v
@@ -106,7 +101,8 @@ class GPT(nn.Module):
             h=[Block(config) for _ in range(config.n_layer)],
             ln_f=nn.LayerNorm(config.n_embd),
         )
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # Use wte weights instead for output projection
+        # self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
     def __call__(self, ix):
         """
@@ -129,7 +125,8 @@ class GPT(nn.Module):
 
         # forward the final layer norm and classifier
         x = self.transformer["ln_f"](x)
-        logits = self.lm_head(x)  # (B, T, V)
+        logits = x @ self.transformer["wte"].weight.T  # (B, T, V)
+
         return logits
 
     @classmethod
@@ -199,43 +196,94 @@ class GPT(nn.Module):
         return model
 
 
-num_return_sequences = 5  # B
-max_length = 30  # T
+def loss_fn(model, X, y):
+    return nn.losses.cross_entropy(model(X), y, reduction="mean")
 
-model = GPT.from_pretrained("gpt2")
-# model = GPT(GPTConfig())
-model.eval()
 
-enc = tiktoken.get_encoding("gpt2")
-tokens = enc.encode("Hello, I'm a language model,")
-tokens = mx.array(tokens, dtype=mx.int64)  # (8,)
-tokens = tokens[None, :]  # (1, 8)
-tokens = mx.repeat(tokens, repeats=num_return_sequences, axis=0)  # (B, 8)
-x = tokens  # (B, T)
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
 
-# generate!
-mx.random.seed(42)
-np.random.seed(42)
-while x.shape[1] < max_length:
-    # forward the model to get the logits
-    logits = model(x)  # (B, T, V)
-    # take the logits at the last position
-    logits = logits[:, -1]  # (B, V)
-    _, V = logits.shape
+        # at init load tokens from disk and store them into memory
+        with open("input.txt", "r") as f:
+            text = f.read()
+        enc = tiktoken.get_encoding("gpt2")
+        tokens = enc.encode(text)
+        self.tokens = mx.array(tokens)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
 
-    # top-k sampling of 50 (HF default)
-    topk_logits = mx.partition(logits, kth=V - 50, axis=-1)[:, -50:]
-    topk_indices = mx.argpartition(logits, kth=V - 50, axis=-1)[:, -50:]  # (B, 50)
-    ix = mx.random.categorical(topk_logits, num_samples=1)  # (B, 1)
+        # state
+        self.current_position = 0
 
-    # gather the corresponding indices
-    xcol = mx.take_along_axis(topk_indices, ix, axis=-1)  # (B, 1)
-    assert xcol.shape == (num_return_sequences, 1)
-    # append to the sequence
-    x = mx.concatenate((x, xcol), axis=1)
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position + B * T + 1]
+        x = (buf[:-1]).reshape(B, T)
+        y = (buf[1:]).reshape(B, T)
+        # advance the position in the tensor
+        self.current_position += B * T
+        # if loading the next batch would be out of bounds, reset
+        if self.current_position + (B * T + 1) > len(self.tokens):
+            self.current_position = 0
+        return x, y
 
-# print the generated text
-for i in range(num_return_sequences):
-    tokens = x[i, :max_length].tolist()
-    decoded = enc.decode(tokens)
-    print(">", decoded)
+
+if __name__ == "__main__":
+    train_loader = DataLoaderLite(B=4, T=32)
+    model = GPT(GPTConfig())
+    value_and_grad_fn = nn.value_and_grad(model, loss_fn)
+
+    # optimize!
+    optimizer = optim.AdamW(learning_rate=3e-4)
+    ud = []
+    for i in range(50):
+        x, y = train_loader.next_batch()
+        # forward pass + loss + backward pass
+        loss, grads = value_and_grad_fn(model, x, y)
+        # optimize step
+        optimizer.update(model, grads)
+        mx.eval(model.state, optimizer.state)
+        print(f"step: {i}, loss: {loss.item():.7f}")
+
+    import sys
+
+    sys.exit(0)
+
+    model.eval()
+    num_return_sequences = 5  # B
+    max_length = 30  # T
+
+    tokens = enc.encode("Hello, I'm a language model,")
+    tokens = mx.array(tokens, dtype=mx.int64)  # (8,)
+    tokens = tokens[None, :]  # (1, 8)
+    tokens = mx.repeat(tokens, repeats=num_return_sequences, axis=0)  # (B, 8)
+    x = tokens  # (B, T)
+
+    # generate!
+    mx.random.seed(42)
+    np.random.seed(42)
+    while x.shape[1] < max_length:
+        # forward the model to get the logits
+        logits = model(x)  # (B, T, V)
+        # take the logits at the last position
+        logits = logits[:, -1]  # (B, V)
+        _, V = logits.shape
+
+        # top-k sampling of 50 (HF default)
+        topk_logits = mx.partition(logits, kth=V - 50, axis=-1)[:, -50:]
+        topk_indices = mx.argpartition(logits, kth=V - 50, axis=-1)[:, -50:]  # (B, 50)
+        ix = mx.random.categorical(topk_logits, num_samples=1)  # (B, 1)
+
+        # gather the corresponding indices
+        xcol = mx.take_along_axis(topk_indices, ix, axis=-1)  # (B, 1)
+        assert xcol.shape == (num_return_sequences, 1)
+        # append to the sequence
+        x = mx.concatenate((x, xcol), axis=1)
+
+    # print the generated text
+    for i in range(num_return_sequences):
+        tokens = x[i, :max_length].tolist()
+        decoded = enc.decode(tokens)
+        print(">", decoded)

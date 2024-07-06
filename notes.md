@@ -87,3 +87,57 @@ A language model defines what I want to do
 ```
 
 On top of that, I created an instance variable `self.bias` to hold this tril, rather than waste cycles computing it at every forward pass.
+
+## add loss function, tiny shakespeare data loader, weight ties
+
+This commit took a bit longer than expected due to some unexpected results from adding tiny shakespeare. I'll try to go into at least some detail.
+
+### loss function
+
+The forward and backward passes of a model is a bit different in MLX. The loss function needs to be separated out and passed into `mlx.nn.value_and_grad` to transform it into one that also computes the gradients of the loss wrt the trainable parameters of the model. Calling this transformed function will then return both the loss and the gradients, the latter of which can be passed into the optimizer for parameter updates.
+
+```
+# forward pass + loss + backward pass
+loss, grads = value_and_grad_fn(model, x, y)
+# optimize step
+optimizer.update(model, grads)
+mx.eval(model.state, optimizer.state)
+```
+
+### tiny shakespeare data loader
+
+Adding in and loading tiny shakespeare was straightforward, including the implementation of the data loader. What was not was attempting to crush a tiny subset of the data by overfitting the model on it. When training a PyTorch GPT2, the loss drops to ~0.1 in the first 10 iterations, 0.002 in 50 iterations. With MLX however, I could barely get that far even in 100 iterations:
+
+```
+step: 97, loss: 2.9546196
+step: 98, loss: 2.9342737
+step: 99, loss: 2.9180717
+```
+
+The model was training consistently, but a lot slower than its PyTorch counterpart. Checking the data distributions of the output logits as both models trained showed that the PyTorch model hovered around unit mean and standard deviation (around 0.6), but this was not the case for the MLX model. While the standard deviation was about the same, the `lm_head` weights were scaling the mean of the output logits at every iteration:
+
+```
+step: 0, loss: 11.2967110, mean: -0.052299946546554565, std: 1.0059481859207153
+step: 1, loss: 12.5933561, mean: 0.22198306024074554, std: 0.992878794670105
+...
+step: 12, loss: 3.9030137, mean: -3.9979491233825684, std: 0.7597995400428772
+step: 13, loss: 3.9129593, mean: -4.290560245513916, std: 0.7966882586479187
+...
+step: 48, loss: 2.6102688, mean: -6.691104412078857, std: 2.827145576477051
+step: 49, loss: 2.6000533, mean: -6.713069438934326, std: 2.87434720993042
+```
+
+I looked at whether this is due to a bug in my model code, differing weight initialization, and even tried plotting out the update/data ratios of the parameters, but I still haven't figured out why this is happening. My next steps would probably involve comparing the backward pass calculations of both models, but I'm out of time. Something potentially promising is that the mean and standard deviations of the pre-trained GPT-2 logits are themselves pretty high, and when training both PyTorch and MLX models on the entire tiny shakespeare dataset yields similar loss distributions.
+
+I did manage to find another bug in my code however through this process, having to do with, once again, the attention matrix calculation. By setting the `bias` causal buffer as an instance variable, it gets treated by MLX as a trainable parameter (via `model.trainable_parameters()`), even if I use `mx.stop_gradient`. I need to look more into the source code to check if gradients actually do flow into this buffer, but for now I have changed the bias buffer name to `buf` and froze it. This seemed to get the trainable parameters counts to finally match up to the PyTorch model's.
+
+### weight ties
+
+In Karpathy's code, he is able to tie to the embedding weights to the "unembedding" weights by simply setting them equal to each other, thus allowing one set of weights to act as a reference for the other. Trying this in MLX though gives unsuccessful results. While there might be a way to replicate this same functionality, I simply took the easy way out and removed the `lm_head` entirely, opting to just multiply the decoder output by the transpose of the embedding weights:
+
+```
+# forward the final layer norm and classifier
+x = self.transformer["ln_f"](x)
+logits = x @ self.transformer["wte"].weight.T  # (B, T, V)
+```
+
