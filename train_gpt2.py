@@ -1,15 +1,16 @@
 # import math
 from dataclasses import dataclass
+import time
 
-# from functools import partial
+from functools import partial
 
 import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 
-# import mlx.core.fast as F
-from mlx.utils import tree_flatten
+import mlx.core.fast as F
+from mlx.utils import tree_flatten, tree_map
 
 import tiktoken
 
@@ -22,18 +23,14 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         # scale
         self.scale = (self.n_embd // self.n_head) ** -0.5
-        # bias buffer (attention mask)
-        T = config.block_size
-        self.buf = mx.stop_gradient(mx.tril(mx.ones(shape=(T, T))).reshape(1, 1, T, T))
-        # freeze buffers
-        self.freeze(keys="buf")
 
-    def __call__(self, x):
+    def __call__(self, x, mask):
         B, T, C = x.shape
 
         q, k, v = self.c_attn(x).split(3, axis=-1)
@@ -42,12 +39,13 @@ class CausalSelfAttention(nn.Module):
         v = v.reshape(B, T, self.n_head, C // self.n_head).transpose(0, 2, 1, 3)
 
         # scaled dot product attention calculation
-        scores = (q @ k.transpose(0, 1, 3, 2)) * self.scale  # (B, nh, T, T)
-        causal_scores = mx.where(
-            self.buf[:, :, :T, :T] == 0, mx.array(float("-inf")), scores
+        y = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            scale=self.scale,
+            mask=mask,
         )
-        att = mx.softmax(causal_scores, axis=-1)
-        y = att @ v
         y = y.transpose(0, 2, 1, 3).reshape(B, T, C)
         y = self.c_proj(y)
         return y
@@ -59,6 +57,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)
         self.gelu = nn.GELU(approx="precise")
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def __call__(self, x):
         x = self.c_fc(x)
@@ -75,8 +74,8 @@ class Block(nn.Module):
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
-    def __call__(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def __call__(self, x, mask):
+        x = x + self.attn(self.ln_1(x), mask)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -101,8 +100,7 @@ class GPT(nn.Module):
             h=[Block(config) for _ in range(config.n_layer)],
             ln_f=nn.LayerNorm(config.n_embd),
         )
-        # Use wte weights instead for output projection
-        # self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.apply_to_modules(self._init_weights)
 
     def __call__(self, ix):
         """
@@ -119,15 +117,33 @@ class GPT(nn.Module):
         tok_emb = self.transformer["wte"](ix)
         x = tok_emb + pos_emb
 
+        mask = nn.MultiHeadAttention.create_additive_causal_mask(T)
+        mask = mask.astype(ix.dtype)
+
         # forward the blocks of the transformer
         for block in self.transformer["h"]:
-            x = block(x)
+            x = block(x, mask)
 
         # forward the final layer norm and classifier
         x = self.transformer["ln_f"](x)
         logits = x @ self.transformer["wte"].weight.T  # (B, T, V)
 
         return logits
+
+    def _init_weights(self, name, module):
+        if isinstance(module, nn.Linear):
+            # roughly javier init std (1/sqrt(D))
+            std = 0.02
+            if hasattr(module, "NANOGPT_SCALE_INIT"):
+                # residual initialization
+                std *= (2 * self.config.n_layer) ** -0.5
+            module.weight = nn.init.normal(mean=0.0, std=std)(module.weight)
+            # module.weight = module.weight.astype(mx.bfloat16)
+            if module.bias is not None:
+                module.bias = nn.init.constant(value=0.0)(module.bias)
+                # module.bias = module.bias.astype(mx.bfloat16)
+        elif isinstance(module, nn.Embedding):
+            module.weight = nn.init.normal(mean=0.0, std=0.02)(module.weight)
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -231,21 +247,47 @@ class DataLoaderLite:
 
 
 if __name__ == "__main__":
-    train_loader = DataLoaderLite(B=4, T=32)
-    model = GPT(GPTConfig())
-    value_and_grad_fn = nn.value_and_grad(model, loss_fn)
+    mx.random.seed(42)
 
-    # optimize!
+    train_loader = DataLoaderLite(B=8, T=1024)
+    model = GPT(GPTConfig(vocab_size=50304))
+    value_and_grad_fn = nn.value_and_grad(model, loss_fn)
     optimizer = optim.AdamW(learning_rate=3e-4)
-    ud = []
-    for i in range(50):
-        x, y = train_loader.next_batch()
+
+    state = [model.state, optimizer.state]
+
+    @partial(mx.compile, inputs=state, outputs=state)
+    def step(X, y):
+        value_and_grad_fn = nn.value_and_grad(model, loss_fn)
         # forward pass + loss + backward pass
-        loss, grads = value_and_grad_fn(model, x, y)
+        loss, grads = value_and_grad_fn(model, X, y)
         # optimize step
         optimizer.update(model, grads)
-        mx.eval(model.state, optimizer.state)
-        print(f"step: {i}, loss: {loss.item():.7f}")
+        return loss
+
+    avg_time_per_step = 0.0
+    avg_tok_per_sec = 0.0
+    max_steps = 50
+    # optimize!
+    for s in range(max_steps):
+        t0 = time.perf_counter()
+        x, y = train_loader.next_batch()
+        loss = step(x, y)
+
+        mx.eval(state)
+        mx.synchronize()  # wait for GPU to finish work
+        t1 = time.perf_counter()
+        dt = t1 - t0  # time difference in ms
+        tokens_processed = train_loader.B * train_loader.T
+        tokens_per_sec = tokens_processed / dt
+        print(
+            f"step: {s:4d} | loss: {loss.item():.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}"
+        )
+        avg_time_per_step += (dt * 1000) / max_steps
+        avg_tok_per_sec += tokens_per_sec / max_steps
+    print(
+        f"avg time/step: {avg_time_per_step:.2f}ms, avg tok/sec: {avg_tok_per_sec:.2f}"
+    )
 
     import sys
 
@@ -262,7 +304,6 @@ if __name__ == "__main__":
     x = tokens  # (B, T)
 
     # generate!
-    mx.random.seed(42)
     np.random.seed(42)
     while x.shape[1] < max_length:
         # forward the model to get the logits

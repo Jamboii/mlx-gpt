@@ -131,6 +131,8 @@ I looked at whether this is due to a bug in my model code, differing weight init
 
 I did manage to find another bug in my code however through this process, having to do with, once again, the attention matrix calculation. By setting the `bias` causal buffer as an instance variable, it gets treated by MLX as a trainable parameter (via `model.trainable_parameters()`), even if I use `mx.stop_gradient`. I need to look more into the source code to check if gradients actually do flow into this buffer, but for now I have changed the bias buffer name to `buf` and froze it. This seemed to get the trainable parameters counts to finally match up to the PyTorch model's.
 
+TODO: append another note to this section regarding looking into the .grad values of the bias parameter
+
 ### weight ties
 
 In Karpathy's code, he is able to tie to the embedding weights to the "unembedding" weights by simply setting them equal to each other, thus allowing one set of weights to act as a reference for the other. Trying this in MLX though gives unsuccessful results. While there might be a way to replicate this same functionality, I simply took the easy way out and removed the `lm_head` entirely, opting to just multiply the decoder output by the transpose of the embedding weights:
@@ -141,3 +143,83 @@ x = self.transformer["ln_f"](x)
 logits = x @ self.transformer["wte"].weight.T  # (B, T, V)
 ```
 
+## weight init, mixed precision, compilation, flash attention, nice numbers
+
+### weight init
+
+MLX has initialization functions via `mlx.nn.init`. These can be applied to all parameters of a module via `module.apply`. I need to apply different initializations to both the weights and biases. While `apply` does take a `filter_fn` input to choose which parameters to initialize, I found it easier to use `.apply_to_modules`, which takes a function that passes in the name of a module in dot notation and the `nn.Module` itself to my weight initialization function. 
+
+Thus, `GPT._init_weights` was created, with weight and bias initializations needing to be set explicitly as opposed to just needing to call the initialization function in PyTorch.
+
+### mixed precision
+
+The next couple of commits to Karpathy's PyTorch repo change to TensorFloat32 matrix multiplications as well as integrate `bfloat16`. TF32 is exclusive to NVIDIA's Ampere and Hopper GPUs, so those free gains are out of the question on M-series chips. What we can use however is `bfloat16`. Now, I personally haven't found any equivalent of mixed-precision training with MLX, but I can at least add bf16 training support by converting what (I believe) would normally be supported by mixed precision into bf16: `Linear` layer parameters.
+
+This is according to what I've learned in the Karpathy video only, so I will probably dig more into this later. Even he mentioned it is not super clear what gets converted. My type conversions were added into the `GPT._init_weights` function.
+
+Let's see if we can get any performance gains here:
+
+```
+B = 8, T = 1024, steps = 50
+base       : avg time/step: 1826.07ms, avg tok/sec: 4491.96
+bf16 linear: avg time/step: 1882.63ms, avg tok/sec: 4356.73
+```
+
+So, it's actually slower? How about if all of the parameters are bf16?
+
+```
+bf16 all   : avg time/step: 1823.34ms, avg tok/sec: 4499.87
+```
+
+Switching to bf16 gives negligible gains in performance, so I'm going to leave it alone for now and continue onward.
+
+### compilation
+
+PyTorch has the functionality included to compile the entire model as a single object with no interpreter involved. This will optimize how many read/writes will need to be performed and remove unnecessary operations that basically cause pointless clock cycles. This is the essence of kernel fusion.
+
+MLX has this functionality as well through `mx.compile` but down to the function level. Again, computation graphs will be compiled and result in smaller graphs via the merging of common work and fusing of operations. From all MLX projects I've seen, it is most beneficial to compile the function which calculates the forward pass, loss, and backward pass gradients and performs an update step. This compiles the overall outer loop of training, while also allowing the model and optimizer state to be lazily evaluated on outside of the function. The result is our `step` function.
+
+Hopefully we will have better luck with performance gains when it comes to compilation:
+
+```
+B = 8, T = 1024, steps = 50
+base     : avg time/step: 1826.07ms, avg tok/sec: 4491.96
+compiled : avg time/step: 1524.74ms, avg tok/sec: 5383.69
+```
+
+Okay, a 300ms speed-up is pretty good! Let's see if we can further optimize this.
+
+### flash attention
+
+A paper from 2022 introduces flash attention, which optimizes the original attention algorithm using kernel fusion. Importantly, it never materializes the atttention weights matrix as you would with calculating attention normally. PyTorch has a version of flash attention built-in, and so does MLX through their `mlx.core.fast` library. Theoretically, our compilation from the last step should also be fusing some kernels for the attention operations, so we might not see any performance gains here.
+
+```
+B = 8, T = 1024, steps = 50
+base       : avg time/step: 1826.07ms, avg tok/sec: 4491.96
+compiled   : avg time/step: 1524.74ms, avg tok/sec: 5383.69
+flash attn : avg time/step: 1519.86ms, avg tok/sec: 5400.97
+```
+
+Yup, so basically the same performance. Just out of curiosity, I wanted to see if flash attention actually was doing anything by itself to increase performance, so I briefly commented out my compilation implementation.
+
+```
+flash attn no compile: avg time/step: 1793.61ms, avg tok/sec: 4574.47
+```
+
+Okay, so there is something noticeable - about 100 tok/sec faster. I'll obviously keep compilation going forward but this was definitely nice to see.
+
+### nice numbers
+
+This next commit from Karpathy seems more important for CUDA optimization since - to my understanding - when calculations on kernel block tiles don't fit neatly into block tiles of powers of two, a second phase must be introduced to process that remaining part. I'm personally not sure how much introducing nice powers of two would help optimize the Metal-side of things, but I can at least try.
+
+This commit changes the input vocab size from 50257 to a nicer 50304.
+
+```
+B = 8, T = 1024, steps = 50
+base       : avg time/step: 1826.07ms, avg tok/sec: 4491.96
+compiled   : avg time/step: 1524.74ms, avg tok/sec: 5383.69
+flash attn : avg time/step: 1519.86ms, avg tok/sec: 5400.97
+nice nums  : avg time/step: 1510.42ms, avg tok/sec: 5434.55
+```
+
+So, not much improvement there. I think it seems feasible to believe that there is some find of performance gain under the hood, but the amount of tokens per second being processed by these M-series chips is so small compared to the amount of compute given by an A100 that those gains are microscopic in comparison.
