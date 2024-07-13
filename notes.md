@@ -223,3 +223,76 @@ nice nums  : avg time/step: 1510.42ms, avg tok/sec: 5434.55
 ```
 
 So, not much improvement there. I think it seems feasible to believe that there is some find of performance gain under the hood, but the amount of tokens per second being processed by these M-series chips is so small compared to the amount of compute given by an A100 that those gains are microscopic in comparison.
+
+## params and grad clip, learning rate scheduler, weight decay, grad accumulation
+
+### params and grad clip
+
+This was relatively straightforward. We clip the calculated gradients to 1.0 using `optim.clip_grad_norm`. This prevents the model from getting too big of shocks in terms of gradient magnitude and is more of an "artificial" kind of regularization method. We also see a noticeable loss improvement after implementing this and defining the AdamW parameters:
+
+```
+B = 8, T = 1024, steps = 50
+nice nums  : loss: 6.489756
+grad clip  : loss: 5.861466 
+```
+
+### learning rate scheduler
+
+A learning rate scheduler is manually implemented with linear warmup until step 10 and cosine decay until step 50. Karpathy's original code uses `if` statements on the `it` iteration to check which schedule to use, but this doesn't play nice with MLX's lazy evaluation and gives an error since we are forcing an evaluation in the middle of a compiled function (our `step` function). To avoid explicit `if` statements, I use `mx.where` instead and implement two functions `warmup` and `cosine` for linear and cosine decay respectively.
+
+I should note that these implementations are taken directly out of MLX's source code, and they even offer a `join_schedules` function for fusing multiple learning rate schedulers. But for the sake of keeping things like Karpathy's original codebase, I kept this manual implementation of the function.
+
+### weight decay
+
+There are no parameter groups in MLX. In PyTorch, you pass your parameters into the initialization of your optimizer, allowing you to customize things like weight decay for specific sets of parameters. In this case, weight decay goes to any 2D parameter like linear and embedding layer weights, and no weight decay goes towards 1D parameters like bias and layer norm weights.
+
+In MLX, since things are a bit more decoupled than PyTorch, we can instead have two AdamW optimizers: one with weight decay, and one without. You cannot keep the same optimizer and just change the weight decay on the fly because every `.update` you make with the optimizer increases the `step` counter in the state, so you're effectively doubling your steps and consequently doubling things like your learning rate decay.
+
+This was a little tricky to sort which gradients to send to each optimizer. Luckily the gradients from the `nn.value_and_grad` function come back as a dictionary of parameters, so we can `tree_flatten` into key-value pairs with the keys as the parameter names in dot notation, and sort by the parameter names we saved to each "optim group". You can also do the dimension check on each gradient tensor right before the gradient update at each step. I've tried both, and neither method seems to be clearly faster than the other.
+
+```
+B = 8, T = 1024, steps = 50
+nice nums    : loss: 6.489756
+grad clip    : loss: 5.861466 
+weight decay : loss: 5.777361
+```
+
+#### on fused AdamW
+
+There is also the addition of fused AdamW in the PyTorch version. Fused is not an attribute that can be supplied to the AdamW definition in MLX, so this change is left out. It is assumed that the compilation of each optimization step through `mx.compile` will fuse operations including the gradient update.
+
+### gradient accumulation
+
+Since GPT2 uses a batch size of 500k tokens (for the 125M parameter model), we need to use that as well for our replication study. In terms of $T=1024$ input sequences, the batch size we'd need would be $B=488$. For the record, I cannot even do $B=16$ without running out of application memory on my 64GB M1 Max. So because 500k tokens will explode our memory, we can use gradient accumulation instead to "accumulate" the gradients of several "micro-batches" until we reach our 500k token capacity (in this case, $2^19$ tokens), and then perform an optimization step. 
+
+So given $2^19=524288$ tokens, by setting a micro-batch size $B=8$ and sequence length $T=1024$, we can calculate the number of gradient accumulation steps using:
+
+$$
+\text{grad-accum-steps}=\text{total-batch-size}//(B*T)=2^{19}/(2^3*2^{10})=2^6=64
+$$
+
+Meaning that 64 gradient accumulation steps (forward pass + backward pass) will take place before performing a single gradient update.
+
+PyTorch can accumulate gradients in micro steps using `loss.backward()` for however many micro-steps are necessary, with those gradients being stored in the parameter graph. With MLX, since our gradients are detached, we can use a `grads_accum` tree to accumulate the gradients instead. 
+
+```
+B = 8, T = 1024, steps = 50
+base       : avg time/step: 1826.07ms, avg tok/sec: 4491.96
+compiled   : avg time/step: 1524.74ms, avg tok/sec: 5383.69
+flash attn : avg time/step: 1519.86ms, avg tok/sec: 5400.97
+nice nums  : avg time/step: 1510.42ms, avg tok/sec: 5434.55
+
+B = 8, T = 1024, steps = 1, microsteps = 64
+grad accum : avg time/mstep: 1622.21ms tok/sec: 5148.09
+```
+
+### potential pitfall: loss reduction
+By default in PyTorch, loss functions have a "reduction" of `mean`, meaning that the cumulative loss, whether it be cross-entropy loss or something else, is divided at the end by the number of samples. With gradient accumulation, that "number of samples" is lost, because you are no longer dividing by the overall batch size but the micro-batch size.
+
+To fix this, the calculated loss after each micro-batch should be divided further by the number of gradient accumulation steps. This makes intuitive sense because it will bring your "mean" ratio for that micro-batch's loss from $1/(B*T)$ to $1/(B*T*\text{grad-accum-steps})$ which in our example is $1/2^3*2^{10}*2^6=1/2^{19}=1/\text{total-batch-size}$.
+
+In MLX we can perform this scaling in the `loss_fn` calculation rather than outside of it so the gradients also get the effects of that scaling.
+
+### potential pitfall: lazy evaluation
+
+MLX employs lazy evaluation, meaning no calculations are performed until the values brought by those calculations are absolutely necessary (e.g. comparison operations, print statements). With gradient accumulation this potentially means running $N$ micro steps (in our case $N=64$) of calculations all at the same time, which means completely avoiding what gradient accumulation was meant to do in the first place: conserve our computer's memory. To prevent my computer from crashing, an `mx.eval` needs to be ran at the end of every micro-batch on the gradients to commit those loss and gradient accumulations to memory, and allow that memory to be overwritten for the next micro-batch.

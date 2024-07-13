@@ -1,4 +1,5 @@
-# import math
+import math
+import inspect
 from dataclasses import dataclass
 import time
 
@@ -10,7 +11,7 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 
 import mlx.core.fast as F
-from mlx.utils import tree_flatten, tree_map
+from mlx.utils import tree_flatten, tree_unflatten, tree_map
 
 import tiktoken
 
@@ -211,9 +212,48 @@ class GPT(nn.Module):
 
         return model
 
+    def configure_optimizers(
+        self, weight_decay, learning_rate, warmup_steps, max_steps
+    ):
+        max_lr = learning_rate
+        min_lr = max_lr * 0.1
 
-def loss_fn(model, X, y):
-    return nn.losses.cross_entropy(model(X), y, reduction="mean")
+        def get_lr(it):
+            def warmup(step):
+                step = mx.minimum(step, warmup_steps)
+                return max_lr * (step + 1) / warmup_steps
+
+            def cosine(step):
+                s = mx.minimum(step, max_steps)
+                decay = 0.5 * (1.0 + mx.cos((math.pi / max_steps) * s))
+                return min_lr + decay * (max_lr - min_lr)
+
+            return mx.where(it < warmup_steps, warmup(it), cosine(it))
+
+        # start with all all candidate parameters
+        params = tree_flatten(self.trainable_parameters())
+        # create optim groups
+        decay_params = [(n, p) for n, p in params if p.ndim >= 2]
+        nodecay_params = [(n, p) for n, p in params if p.ndim < 2]
+        optim_groups = {
+            "decay": [n for n, _ in decay_params],
+            "nodecay": [n for n, _ in nodecay_params],
+        }
+        num_decay_params = sum(p.size for _, p in decay_params)
+        num_nodecay_params = sum(p.size for _, p in nodecay_params)
+        print(
+            f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters"
+        )
+        print(
+            f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters"
+        )
+        optimizer_decay = optim.AdamW(
+            learning_rate=get_lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=weight_decay
+        )
+        optimizer_nodecay = optim.AdamW(
+            learning_rate=get_lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0
+        )
+        return optimizer_decay, optimizer_nodecay, optim_groups
 
 
 class DataLoaderLite:
@@ -249,39 +289,99 @@ class DataLoaderLite:
 if __name__ == "__main__":
     mx.random.seed(42)
 
-    train_loader = DataLoaderLite(B=8, T=1024)
-    model = GPT(GPTConfig(vocab_size=50304))
-    value_and_grad_fn = nn.value_and_grad(model, loss_fn)
-    optimizer = optim.AdamW(learning_rate=3e-4)
+    max_steps = 50
 
-    state = [model.state, optimizer.state]
+    # dataset and accumulation step size
+    total_batch_size = 524288  # 2**19, ~0.5M in number of tokens
+    B, T = 8, 1024
+    assert (
+        total_batch_size % (B * T) == 0
+    ), "make sure total_batch_size is divisible by B*T"
+    grad_accum_steps = total_batch_size // (B * T)
+    print(f"total desired batch size: {total_batch_size}")
+    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+    train_loader = DataLoaderLite(B=B, T=T)
+
+    # accumulation function for training time
+    def accum_fn(grad_accum, grad_new):
+        return grad_accum + grad_new
+
+    # model + optimizer declaration
+    model = GPT(GPTConfig(vocab_size=50304))
+
+    # loss function
+    # we need to account for gradient accumulation with each loss calculation
+    def loss_fn(model, X, y):
+        return nn.losses.cross_entropy(model(X), y, reduction="mean") * (
+            1.0 / grad_accum_steps
+        )
+
+    value_and_grad_fn = nn.value_and_grad(model, loss_fn)
+    decay_optimizer, nodecay_optimizer, optim_groups = model.configure_optimizers(
+        weight_decay=0.1, learning_rate=6e-4, warmup_steps=10, max_steps=max_steps
+    )
+
+    state = [model.state, decay_optimizer.state, nodecay_optimizer.state]
 
     @partial(mx.compile, inputs=state, outputs=state)
-    def step(X, y):
-        value_and_grad_fn = nn.value_and_grad(model, loss_fn)
+    def micro_step(X, y, loss_accum, grads_accum):
         # forward pass + loss + backward pass
         loss, grads = value_and_grad_fn(model, X, y)
+        # accumulate loss and gradients
+        loss_accum += loss
+        grads_accum = tree_map(accum_fn, grads_accum, grads)
+        return loss_accum, grads_accum
+
+    @partial(mx.compile, inputs=state, outputs=state)
+    def optim_step(grads):
+        # clip gradients
+        clipped_grads, norm = optim.clip_grad_norm(grads, max_norm=1.0)
+        # weight decay
+        flatten_grads = dict(tree_flatten(clipped_grads))
+        decay_grads = tree_unflatten(
+            [(n, flatten_grads[n]) for n in optim_groups["decay"]]
+        )
+        nodecay_grads = tree_unflatten(
+            [(n, flatten_grads[n]) for n in optim_groups["nodecay"]]
+        )
         # optimize step
-        optimizer.update(model, grads)
-        return loss
+        decay_optimizer.update(model, decay_grads)
+        nodecay_optimizer.update(model, nodecay_grads)
+        return norm
 
     avg_time_per_step = 0.0
     avg_tok_per_sec = 0.0
-    max_steps = 50
     # optimize!
     for s in range(max_steps):
         t0 = time.perf_counter()
-        x, y = train_loader.next_batch()
-        loss = step(x, y)
+
+        # create loss and gradient accumulators
+        loss_accum = mx.zeros(shape=(1,))
+        grads_accum = tree_map(lambda x: mx.zeros_like(x), model.trainable_parameters())
+        for mstep in range(grad_accum_steps):
+            # time the micro-steps since each full
+            # step is really slow now
+            t2 = time.perf_counter()
+            x, y = train_loader.next_batch()
+
+            loss_accum, grads_accum = micro_step(x, y, loss_accum, grads_accum)
+            # evaluate at each micro step to avoid destroying our memory
+            tree_map(lambda grad: mx.eval(grad), grads_accum)
+            t3 = time.perf_counter()
+            print(f"microstep {mstep}, dt: {(t3-t2)*1000:.2f}ms")
+
+        # optimize step
+        norm = optim_step(grads_accum)
 
         mx.eval(state)
         mx.synchronize()  # wait for GPU to finish work
         t1 = time.perf_counter()
         dt = t1 - t0  # time difference in ms
-        tokens_processed = train_loader.B * train_loader.T
+        tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
         tokens_per_sec = tokens_processed / dt
+        lr = decay_optimizer.learning_rate
         print(
-            f"step: {s:4d} | loss: {loss.item():.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}"
+            f"step: {s:4d} | loss: {loss_accum.item():.6f} | lr: {lr.item():.4e} | norm: {norm.item():.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}"
         )
         avg_time_per_step += (dt * 1000) / max_steps
         avg_tok_per_sec += tokens_per_sec / max_steps
