@@ -1,7 +1,7 @@
 import math
-import inspect
 from dataclasses import dataclass
 import time
+import os
 
 from functools import partial
 
@@ -241,12 +241,13 @@ class GPT(nn.Module):
         }
         num_decay_params = sum(p.size for _, p in decay_params)
         num_nodecay_params = sum(p.size for _, p in nodecay_params)
-        print(
-            f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters"
-        )
-        print(
-            f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters"
-        )
+        if master_process:
+            print(
+                f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters"
+            )
+            print(
+                f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters"
+            )
         optimizer_decay = optim.AdamW(
             learning_rate=get_lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=weight_decay
         )
@@ -257,9 +258,11 @@ class GPT(nn.Module):
 
 
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_processes):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
 
         # at init load tokens from disk and store them into memory
         with open("input.txt", "r") as f:
@@ -267,11 +270,11 @@ class DataLoaderLite:
         enc = tiktoken.get_encoding("gpt2")
         tokens = enc.encode(text)
         self.tokens = mx.array(tokens)
-        print(f"loaded {len(self.tokens)} tokens")
-        print(f"1 epoch = {len(self.tokens) // (B*T)} batches")
+        if master_process:
+            print(f"loaded {len(self.tokens)} tokens")
 
         # state
-        self.current_position = 0
+        self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -279,14 +282,34 @@ class DataLoaderLite:
         x = (buf[:-1]).reshape(B, T)
         y = (buf[1:]).reshape(B, T)
         # advance the position in the tensor
-        self.current_position += B * T
+        self.current_position += B * T * self.num_processes
         # if loading the next batch would be out of bounds, reset
-        if self.current_position + (B * T + 1) > len(self.tokens):
-            self.current_position = 0
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_position = self.B * self.T * self.process_rank
         return x, y
 
 
 if __name__ == "__main__":
+    # set up a distributed communication run
+    dc = int(os.environ.get("OMPI_COMM_WORLD_RANK", -1)) != -1
+    if dc:
+        assert (
+            mx.distributed.is_available()
+        ), "Distributed communication is not available"
+        world = mx.distributed.init()
+        dc_rank = world.rank()
+        dc_local_rank = int(os.environ["OMPI_COMM_WORLD_LOCAL_RANK"])
+        dc_world_size = world.size()
+        master_process = dc_rank == 0
+        print(f"using device {mx.default_device()}, rank: {dc_rank}")
+    else:
+        # vanilla, non-dc run
+        dc_rank = 0
+        dc_local_rank = 0
+        dc_world_size = 1
+        master_process = True
+        print(f"using device: {mx.default_device()}")
+
     mx.random.seed(42)
 
     max_steps = 50
@@ -295,16 +318,18 @@ if __name__ == "__main__":
     total_batch_size = 524288  # 2**19, ~0.5M in number of tokens
     B, T = 8, 1024
     assert (
-        total_batch_size % (B * T) == 0
-    ), "make sure total_batch_size is divisible by B*T"
-    grad_accum_steps = total_batch_size // (B * T)
-    print(f"total desired batch size: {total_batch_size}")
-    print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
-    train_loader = DataLoaderLite(B=B, T=T)
-
-    # accumulation function for training time
-    def accum_fn(grad_accum, grad_new):
-        return grad_accum + grad_new
+        total_batch_size % (B * T * dc_world_size) == 0
+    ), "make sure total_batch_size is divisible by B*T*dc_world_size"
+    grad_accum_steps = total_batch_size // (B * T * dc_world_size)
+    if master_process:
+        print(f"total desired batch size: {total_batch_size}")
+        print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+    train_loader = DataLoaderLite(
+        B=B,
+        T=T,
+        process_rank=dc_rank,
+        num_processes=dc_world_size,
+    )
 
     # model + optimizer declaration
     model = GPT(GPTConfig(vocab_size=50304))
@@ -323,13 +348,20 @@ if __name__ == "__main__":
 
     state = [model.state, decay_optimizer.state, nodecay_optimizer.state]
 
+    def all_reduce_grads(grads):
+        # reduce gradients across the "world"
+        if dc_world_size == 1:
+            return grads
+        return tree_map(lambda x: mx.distributed.all_sum(x) / dc_world_size, grads)
+
     @partial(mx.compile, inputs=state, outputs=state)
     def micro_step(X, y, loss_accum, grads_accum):
         # forward pass + loss + backward pass
         loss, grads = value_and_grad_fn(model, X, y)
+        grads = all_reduce_grads(grads)
         # accumulate loss and gradients
         loss_accum += loss
-        grads_accum = tree_map(accum_fn, grads_accum, grads)
+        grads_accum = tree_map(lambda g1, g2: g1 + g2, grads_accum, grads)
         return loss_accum, grads_accum
 
     @partial(mx.compile, inputs=state, outputs=state)
@@ -368,26 +400,39 @@ if __name__ == "__main__":
             # evaluate at each micro step to avoid destroying our memory
             tree_map(lambda grad: mx.eval(grad), grads_accum)
             t3 = time.perf_counter()
-            print(f"microstep {mstep}, dt: {(t3-t2)*1000:.2f}ms")
+            if master_process:
+                print(f"microstep {mstep}, dt: {(t3-t2)*1000:.2f}ms")
 
         # optimize step
         norm = optim_step(grads_accum)
 
         mx.eval(state)
         mx.synchronize()  # wait for GPU to finish work
+
+        # average loss across processes after state evaluation
+        if dc:
+            loss_accum = mx.distributed.all_sum(loss_accum) / dc_world_size
+        loss_accum = loss_accum.item()
+
         t1 = time.perf_counter()
         dt = t1 - t0  # time difference in ms
-        tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
+        tokens_processed = (
+            train_loader.B * train_loader.T * grad_accum_steps * dc_world_size
+        )
         tokens_per_sec = tokens_processed / dt
         lr = decay_optimizer.learning_rate
+        # average the epoch loss
+        if master_process:
+            print(
+                f"step: {s:4d} | loss: {loss_accum:.6f} | lr: {lr.item():.4e} | norm: {norm.item():.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}"
+            )
+            avg_time_per_step += (dt * 1000) / max_steps
+            avg_tok_per_sec += tokens_per_sec / max_steps
+
+    if master_process:
         print(
-            f"step: {s:4d} | loss: {loss_accum.item():.6f} | lr: {lr.item():.4e} | norm: {norm.item():.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}"
+            f"avg time/step: {avg_time_per_step:.2f}ms, avg tok/sec: {avg_tok_per_sec:.2f}"
         )
-        avg_time_per_step += (dt * 1000) / max_steps
-        avg_tok_per_sec += tokens_per_sec / max_steps
-    print(
-        f"avg time/step: {avg_time_per_step:.2f}ms, avg tok/sec: {avg_tok_per_sec:.2f}"
-    )
 
     import sys
 

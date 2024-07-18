@@ -296,3 +296,19 @@ In MLX we can perform this scaling in the `loss_fn` calculation rather than outs
 ### potential pitfall: lazy evaluation
 
 MLX employs lazy evaluation, meaning no calculations are performed until the values brought by those calculations are absolutely necessary (e.g. comparison operations, print statements). With gradient accumulation this potentially means running $N$ micro steps (in our case $N=64$) of calculations all at the same time, which means completely avoiding what gradient accumulation was meant to do in the first place: conserve our computer's memory. To prevent my computer from crashing, an `mx.eval` needs to be ran at the end of every micro-batch on the gradients to commit those loss and gradient accumulations to memory, and allow that memory to be overwritten for the next micro-batch.
+
+### distributed communications
+
+With just one system using an M-series chip, we cannot take advantage of distributed communications, but we can at least implement it. MLX provides distributed communication through MPI such that training can be split across many physical machines. For example, we could send the burden of our training to multiple Mac Studios with M2 Ultra chips so we can utilize their compute from an originating system.
+
+This can be implemented through `mx.distributed` and installation of `openmpi`. Running `mpirun` or `mpiexec` is the equivalent of using `torchrun` with PyTorch DDP. Like DDP, environment variables are also set for the world size and rank of each machine:
+- rank: `OMPI_COMM_WORLD_RANK`
+- local rank: `OMPI_COMM_WORLD_LOCAL_RANK`
+- world size: `OMPI_WORLD_SIZE`
+
+Luckily, we can also access these values through the `mx.distributed` API. By calling `mx.distributed.init()` to initialize a "world", we get access to `.rank()` and `.size()` for world rank and world size respectively.
+
+On top of making sure that each process isn't iterating over the same training data per step/micro-step, we care about two main calculations with distributed communications: loss and gradients. 
+- At the end of each gradient calculation (each micro-step) we need to average the gradients over all processes. This is typically known as an `all_reduce`, but MLX has `mx.distributed.all_sum`, which can sum a variable across all the processes. All we need to do is divide that sum by the world size, and we're done. This becomes the `all_reduce_grads` function.
+- At the end of each full step, we need to average the loss over all processes. Keep in mind we have just performed gradient accumulation on the loss, scaling it by 1/"grad accum steps" every micro step. But this is happening across every process, so we need to average the loss again. This can be performed exactly like the gradient calculation via `mx.distributed.all_sum` and dividing by the world size we've already predetermined.
+
