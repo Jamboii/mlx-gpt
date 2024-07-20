@@ -354,3 +354,42 @@ So, very little learning going on here, but there is something! Maybe if I train
 ## data shuffling
 
 I added a small additional feature which would permute the training and validation datasets each time a reset back to the starting position was necessary. This would prevent the model from potentially learning any order intrinsic to the dataset "tape" being fed in at each micro step.
+
+## retrain with new hyperparameters, update readme, and afterward
+
+### retrain with new hyperparameters
+
+Backing up a bit, I figured I was a bit naive for thinking that I could get decent results by using the configuration of the 125M GPT-2 on tiny shakespeare. This was a bit too overkill, so I went back to Karpathy's original [configuration](https://github.com/karpathy/nanoGPT/blob/master/config/train_shakespeare_char.py) for training a character-level shakespeare model, and changed around the configuration to use those numbers. After 1000 steps, here are the generation results:
+
+```
+validation loss: 12.0084
+step: 1000 | loss: 0.074364 | lr: 1.8281e-03 | norm: 0.4042 | dt: 1414.41ms | tok/sec: 11583.66
+> ALONSO:
+We were I, I,
+IIursed I be my virtue or whose pleasure that, long: for
+Like plith on
+> ALONSO:
+But I, I Capitol.
+
+POLIXENES:
+Say that you heart, my lord
+
+She begins, I
+> ALONSO:
+We submit we?
+
+Knows shall yet to give his HENRY VI:
+Their Lord:
+Coriolanus,
+> ALONSO:
+You must be my Jack wrong?
+
+KING HENRY VI:
+Alas fear their greatest mercy! why, I started
+```
+
+This is a lot better than before, albeit the model is MASSIVELY overfitting (the validation loss actually started to continually increase, uh oh). I think in the future it would be good to try and tune these parameters a bit more provided we are using BPE tokens instead of characters.
+
+### afterward
+
+For now, this is where I will stop this project. It was very fun coming back to this repository every day and figuring out this "puzzle" of migrating a PyTorch implementation into an MLX implementation. I definitely thought I would see a bit more of speed improvements through things like flash attention and mixed precision, but I am quite happy with the current results. I'm hoping that if I return to MLX that this project will have served me well enough that I don't have to do the same research all over again.

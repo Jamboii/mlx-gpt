@@ -249,10 +249,18 @@ class GPT(nn.Module):
                 f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters"
             )
         optimizer_decay = optim.AdamW(
-            learning_rate=get_lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=weight_decay
+            learning_rate=get_lr,
+            # betas=(0.9, 0.95),
+            betas=(0.9, 0.99),
+            eps=1e-8,
+            weight_decay=weight_decay,
         )
         optimizer_nodecay = optim.AdamW(
-            learning_rate=get_lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0
+            learning_rate=get_lr,
+            # betas=(0.9, 0.95),
+            betas=(0.9, 0.99),
+            eps=1e-8,
+            weight_decay=0.0,
         )
         return optimizer_decay, optimizer_nodecay, optim_groups
 
@@ -334,8 +342,9 @@ if __name__ == "__main__":
 
     # dataset and accumulation step size
     # total_batch_size = 524288  # 2**19, ~0.5M in number of tokens
-    total_batch_size = 32768  # 2**15
-    B, T = 8, 1024
+    total_batch_size = 16384  # 2**14
+    # B, T = 8, 1024
+    B, T = 4, 256
     assert (
         total_batch_size % (B * T * dc_world_size) == 0
     ), "make sure total_batch_size is divisible by B*T*dc_world_size"
@@ -351,7 +360,14 @@ if __name__ == "__main__":
     )
 
     # model + optimizer declaration
-    model = GPT(GPTConfig(vocab_size=50304))
+    model = GPT(
+        GPTConfig(
+            vocab_size=50304,
+            n_layer=6,
+            n_head=6,
+            n_embd=384,
+        )
+    )
 
     # loss function
     # we need to account for gradient accumulation with each loss calculation
@@ -360,12 +376,12 @@ if __name__ == "__main__":
             1.0 / grad_accum_steps
         )
 
-    max_steps = 1001
+    max_steps = 5000
     value_and_grad_fn = nn.value_and_grad(model, loss_fn)
     decay_optimizer, nodecay_optimizer, optim_groups = model.configure_optimizers(
         weight_decay=0.1,
-        learning_rate=18e-4,
-        warmup_steps=40,
+        learning_rate=2e-3,
+        warmup_steps=100,
         max_steps=max_steps,
     )
 
