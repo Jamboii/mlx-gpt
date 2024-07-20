@@ -351,4 +351,6 @@ For
 
 So, very little learning going on here, but there is something! Maybe if I trained it for longer it could start to produce more coherent sentences.
 
+## data shuffling
 
+I added a small additional feature which would permute the training and validation datasets each time a reset back to the starting position was necessary. This would prevent the model from potentially learning any order intrinsic to the dataset "tape" being fed in at each micro step.

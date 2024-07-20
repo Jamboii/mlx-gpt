@@ -282,6 +282,16 @@ class DataLoaderLite:
         self.reset()
 
     def reset(self):
+        # shuffle the tokens so the model
+        # doesn't try to learn the order of the inputs
+        self.tokens = np.array(self.tokens)
+        blocks = self.tokens.shape[0] // (self.B * self.T)
+        self.tokens = self.tokens[: blocks * self.B * self.T].reshape(
+            blocks, self.B * self.T
+        )  # (blocks, BT)
+        np.random.shuffle(self.tokens)  # shuffle along blocks axis
+        self.tokens = mx.array(self.tokens).reshape(-1)  # flatten back into 1D array
+
         # state
         self.current_position = self.B * self.T * self.process_rank
 
@@ -294,7 +304,7 @@ class DataLoaderLite:
         self.current_position += B * T * self.num_processes
         # if loading the next batch would be out of bounds, reset
         if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-            self.current_position = self.B * self.T * self.process_rank
+            self.reset()
         return x, y
 
 
@@ -320,6 +330,7 @@ if __name__ == "__main__":
         print(f"using device: {mx.default_device()}")
 
     mx.random.seed(42)
+    np.random.seed(42)
 
     # dataset and accumulation step size
     # total_batch_size = 524288  # 2**19, ~0.5M in number of tokens
@@ -352,7 +363,10 @@ if __name__ == "__main__":
     max_steps = 1001
     value_and_grad_fn = nn.value_and_grad(model, loss_fn)
     decay_optimizer, nodecay_optimizer, optim_groups = model.configure_optimizers(
-        weight_decay=0.1, learning_rate=6e-4, warmup_steps=40, max_steps=max_steps
+        weight_decay=0.1,
+        learning_rate=18e-4,
+        warmup_steps=40,
+        max_steps=max_steps,
     )
 
     state = [model.state, decay_optimizer.state, nodecay_optimizer.state]
@@ -399,7 +413,7 @@ if __name__ == "__main__":
             model.eval()
             val_loader.reset()
             val_loss_accum = mx.zeros(shape=(1,))
-            val_loss_steps = 20
+            val_loss_steps = 16
 
             def val_loss_fn(model, X, y):
                 return nn.losses.cross_entropy(model(X), y, reduction="mean") * (
