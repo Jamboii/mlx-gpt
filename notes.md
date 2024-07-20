@@ -286,18 +286,19 @@ B = 8, T = 1024, steps = 1, microsteps = 64
 grad accum : avg time/mstep: 1622.21ms tok/sec: 5148.09
 ```
 
-### potential pitfall: loss reduction
+#### potential pitfall: loss reduction
+
 By default in PyTorch, loss functions have a "reduction" of `mean`, meaning that the cumulative loss, whether it be cross-entropy loss or something else, is divided at the end by the number of samples. With gradient accumulation, that "number of samples" is lost, because you are no longer dividing by the overall batch size but the micro-batch size.
 
 To fix this, the calculated loss after each micro-batch should be divided further by the number of gradient accumulation steps. This makes intuitive sense because it will bring your "mean" ratio for that micro-batch's loss from $1/(B*T)$ to $1/(B*T*\text{grad-accum-steps})$ which in our example is $1/2^3*2^{10}*2^6=1/2^{19}=1/\text{total-batch-size}$.
 
 In MLX we can perform this scaling in the `loss_fn` calculation rather than outside of it so the gradients also get the effects of that scaling.
 
-### potential pitfall: lazy evaluation
+#### potential pitfall: lazy evaluation
 
 MLX employs lazy evaluation, meaning no calculations are performed until the values brought by those calculations are absolutely necessary (e.g. comparison operations, print statements). With gradient accumulation this potentially means running $N$ micro steps (in our case $N=64$) of calculations all at the same time, which means completely avoiding what gradient accumulation was meant to do in the first place: conserve our computer's memory. To prevent my computer from crashing, an `mx.eval` needs to be ran at the end of every micro-batch on the gradients to commit those loss and gradient accumulations to memory, and allow that memory to be overwritten for the next micro-batch.
 
-### distributed communications
+## distributed communications
 
 With just one system using an M-series chip, we cannot take advantage of distributed communications, but we can at least implement it. MLX provides distributed communication through MPI such that training can be split across many physical machines. For example, we could send the burden of our training to multiple Mac Studios with M2 Ultra chips so we can utilize their compute from an originating system.
 
@@ -311,4 +312,43 @@ Luckily, we can also access these values through the `mx.distributed` API. By ca
 On top of making sure that each process isn't iterating over the same training data per step/micro-step, we care about two main calculations with distributed communications: loss and gradients. 
 - At the end of each gradient calculation (each micro-step) we need to average the gradients over all processes. This is typically known as an `all_reduce`, but MLX has `mx.distributed.all_sum`, which can sum a variable across all the processes. All we need to do is divide that sum by the world size, and we're done. This becomes the `all_reduce_grads` function.
 - At the end of each full step, we need to average the loss over all processes. Keep in mind we have just performed gradient accumulation on the loss, scaling it by 1/"grad accum steps" every micro step. But this is happening across every process, so we need to average the loss again. This can be performed exactly like the gradient calculation via `mx.distributed.all_sum` and dividing by the world size we've already predetermined.
+
+## validation and generation
+
+Wrapping up. I've decided to avoid adding the code to download/shard FineWeb EDU because I don't think this mac can handle it. I am sticking with tiny shakespeare and I've split it into a `train` and `val` file where the validation file contains 20% of the training dataset (~8k/40k lines of text).
+
+I've added a validation loader and drastically reduced the batch size to 2^15 (which can probably be tweaked further).
+
+I've also moved up the generation code which is unchanged and I have the model running for 1000 steps with validation/generation every 100.
+
+At 500 steps, this is what gets generated:
+
+```
+ ALONSO:
+In me there he may thee will her with the people shall wtThen voices A RY:
+
+
+IET: like
+> ALONSO:
+
+MENAST heart
+FIDIOL BINGHAM
+FRIicity of this,
+Thmar,
+
+> ALONSO:
+SoOLOLANING' my lord hath that they have a peoplekeBRTH RY:
+
+
+
+This is all
+> ALONSO:
+
+JUL' the air or the king.
+For
+'Tque can have his that will be his soul and I thank
+```
+
+So, very little learning going on here, but there is something! Maybe if I trained it for longer it could start to produce more coherent sentences.
+
 

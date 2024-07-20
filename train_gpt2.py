@@ -257,22 +257,31 @@ class GPT(nn.Module):
         return optimizer_decay, optimizer_nodecay, optim_groups
 
 
+enc = tiktoken.get_encoding("gpt2")
+
+
 class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes):
+    def __init__(self, B, T, process_rank, num_processes, split):
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
+        assert split in {"train", "val"}
+        filename = "train.txt"
+        if split == "val":
+            filename = "val.txt"
 
         # at init load tokens from disk and store them into memory
-        with open("input.txt", "r") as f:
+        with open(filename, "r") as f:
             text = f.read()
-        enc = tiktoken.get_encoding("gpt2")
         tokens = enc.encode(text)
         self.tokens = mx.array(tokens)
         if master_process:
             print(f"loaded {len(self.tokens)} tokens")
 
+        self.reset()
+
+    def reset(self):
         # state
         self.current_position = self.B * self.T * self.process_rank
 
@@ -312,10 +321,9 @@ if __name__ == "__main__":
 
     mx.random.seed(42)
 
-    max_steps = 50
-
     # dataset and accumulation step size
-    total_batch_size = 524288  # 2**19, ~0.5M in number of tokens
+    # total_batch_size = 524288  # 2**19, ~0.5M in number of tokens
+    total_batch_size = 32768  # 2**15
     B, T = 8, 1024
     assert (
         total_batch_size % (B * T * dc_world_size) == 0
@@ -325,10 +333,10 @@ if __name__ == "__main__":
         print(f"total desired batch size: {total_batch_size}")
         print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
     train_loader = DataLoaderLite(
-        B=B,
-        T=T,
-        process_rank=dc_rank,
-        num_processes=dc_world_size,
+        B=B, T=T, process_rank=dc_rank, num_processes=dc_world_size, split="train"
+    )
+    val_loader = DataLoaderLite(
+        B=B, T=T, process_rank=dc_rank, num_processes=dc_world_size, split="val"
     )
 
     # model + optimizer declaration
@@ -341,9 +349,10 @@ if __name__ == "__main__":
             1.0 / grad_accum_steps
         )
 
+    max_steps = 1001
     value_and_grad_fn = nn.value_and_grad(model, loss_fn)
     decay_optimizer, nodecay_optimizer, optim_groups = model.configure_optimizers(
-        weight_decay=0.1, learning_rate=6e-4, warmup_steps=10, max_steps=max_steps
+        weight_decay=0.1, learning_rate=6e-4, warmup_steps=40, max_steps=max_steps
     )
 
     state = [model.state, decay_optimizer.state, nodecay_optimizer.state]
@@ -384,24 +393,37 @@ if __name__ == "__main__":
     avg_time_per_step = 0.0
     avg_tok_per_sec = 0.0
     # optimize!
-    for s in range(max_steps):
-        t0 = time.perf_counter()
+    for step in range(max_steps):
+        # once in a while evaluate our validation loss
+        if step % 100 == 0:
+            model.eval()
+            val_loader.reset()
+            val_loss_accum = mx.zeros(shape=(1,))
+            val_loss_steps = 20
+
+            def val_loss_fn(model, X, y):
+                return nn.losses.cross_entropy(model(X), y, reduction="mean") * (
+                    1.0 / val_loss_steps
+                )
+
+            for mstep in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                val_loss_accum += val_loss_fn(model, x, y)
+            if dc:
+                val_loss_accum = mx.distributed.all_sum(val_loss_accum) / dc_world_size
+            val_loss_accum = val_loss_accum.item()
+            if master_process:
+                print(f"validation loss: {val_loss_accum:.4f}")
 
         # create loss and gradient accumulators
+        t0 = time.perf_counter()
         loss_accum = mx.zeros(shape=(1,))
         grads_accum = tree_map(lambda x: mx.zeros_like(x), model.trainable_parameters())
         for mstep in range(grad_accum_steps):
-            # time the micro-steps since each full
-            # step is really slow now
-            t2 = time.perf_counter()
             x, y = train_loader.next_batch()
-
             loss_accum, grads_accum = micro_step(x, y, loss_accum, grads_accum)
             # evaluate at each micro step to avoid destroying our memory
             tree_map(lambda grad: mx.eval(grad), grads_accum)
-            t3 = time.perf_counter()
-            if master_process:
-                print(f"microstep {mstep}, dt: {(t3-t2)*1000:.2f}ms")
 
         # optimize step
         norm = optim_step(grads_accum)
@@ -424,52 +446,52 @@ if __name__ == "__main__":
         # average the epoch loss
         if master_process:
             print(
-                f"step: {s:4d} | loss: {loss_accum:.6f} | lr: {lr.item():.4e} | norm: {norm.item():.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}"
+                f"step: {step:4d} | loss: {loss_accum:.6f} | lr: {lr.item():.4e} | norm: {norm.item():.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}"
             )
             avg_time_per_step += (dt * 1000) / max_steps
             avg_tok_per_sec += tokens_per_sec / max_steps
+
+        # once in a while generate from the model, except for step 0
+        if step > 0 and step % 100 == 0:
+            model.eval()
+            num_return_sequences = 4  # B
+            max_length = 32  # T
+
+            tokens = enc.encode("ALONSO:")
+            tokens = mx.array(tokens, dtype=mx.int64)  # (8,)
+            tokens = tokens[None, :]  # (1, 8)
+            tokens = mx.repeat(tokens, repeats=num_return_sequences, axis=0)  # (B, 8)
+            x = tokens  # (B, T)
+
+            # generate!
+            np.random.seed(42)
+            while x.shape[1] < max_length:
+                # forward the model to get the logits
+                logits = model(x)  # (B, T, V)
+                # take the logits at the last position
+                logits = logits[:, -1]  # (B, V)
+                _, V = logits.shape
+
+                # top-k sampling of 50 (HF default)
+                topk_logits = mx.partition(logits, kth=V - 50, axis=-1)[:, -50:]
+                topk_indices = mx.argpartition(logits, kth=V - 50, axis=-1)[
+                    :, -50:
+                ]  # (B, 50)
+                ix = mx.random.categorical(topk_logits, num_samples=1)  # (B, 1)
+
+                # gather the corresponding indices
+                xcol = mx.take_along_axis(topk_indices, ix, axis=-1)  # (B, 1)
+                assert xcol.shape == (num_return_sequences, 1)
+                # append to the sequence
+                x = mx.concatenate((x, xcol), axis=1)
+
+            # print the generated text
+            for i in range(num_return_sequences):
+                tokens = x[i, :max_length].tolist()
+                decoded = enc.decode(tokens)
+                print(">", decoded)
 
     if master_process:
         print(
             f"avg time/step: {avg_time_per_step:.2f}ms, avg tok/sec: {avg_tok_per_sec:.2f}"
         )
-
-    import sys
-
-    sys.exit(0)
-
-    model.eval()
-    num_return_sequences = 5  # B
-    max_length = 30  # T
-
-    tokens = enc.encode("Hello, I'm a language model,")
-    tokens = mx.array(tokens, dtype=mx.int64)  # (8,)
-    tokens = tokens[None, :]  # (1, 8)
-    tokens = mx.repeat(tokens, repeats=num_return_sequences, axis=0)  # (B, 8)
-    x = tokens  # (B, T)
-
-    # generate!
-    np.random.seed(42)
-    while x.shape[1] < max_length:
-        # forward the model to get the logits
-        logits = model(x)  # (B, T, V)
-        # take the logits at the last position
-        logits = logits[:, -1]  # (B, V)
-        _, V = logits.shape
-
-        # top-k sampling of 50 (HF default)
-        topk_logits = mx.partition(logits, kth=V - 50, axis=-1)[:, -50:]
-        topk_indices = mx.argpartition(logits, kth=V - 50, axis=-1)[:, -50:]  # (B, 50)
-        ix = mx.random.categorical(topk_logits, num_samples=1)  # (B, 1)
-
-        # gather the corresponding indices
-        xcol = mx.take_along_axis(topk_indices, ix, axis=-1)  # (B, 1)
-        assert xcol.shape == (num_return_sequences, 1)
-        # append to the sequence
-        x = mx.concatenate((x, xcol), axis=1)
-
-    # print the generated text
-    for i in range(num_return_sequences):
-        tokens = x[i, :max_length].tolist()
-        decoded = enc.decode(tokens)
-        print(">", decoded)
